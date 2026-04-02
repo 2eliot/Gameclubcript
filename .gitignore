@@ -1,0 +1,36 @@
+# Node modules
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.ico
+
+# Env files
+.env
+.env.*
+
+# VSCode
+.vscode/
+
+# Others
+*.zip
+*.tar.gz
+*.rar
+
+# Playwright
+playwright-report/
