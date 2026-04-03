@@ -14,6 +14,8 @@ const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT || (IS_PRODUCTION ? 5005 : 5006));
 const MAX_CONCURRENCIA = 2;
 const REQUEST_STORE_FILE = path.join(__dirname, 'game-request-store.json');
+const REQUEST_QUEUE_STALE_MS = Number(process.env.REQUEST_QUEUE_STALE_MS || 2 * 60 * 1000);
+const REQUEST_PROCESSING_STALE_MS = Number(process.env.REQUEST_PROCESSING_STALE_MS || 10 * 60 * 1000);
 const DEFAULT_PACKAGES = {
     '50_gold': { goodsid: 'g83naxx1ena.USD.gold50.ally', goodsinfo: '50 barras de oro' },
     '100_gold': { goodsid: 'g83naxx1ena.USD.gold100.ally', goodsinfo: '100 barras de oro' },
@@ -24,6 +26,7 @@ const DEFAULT_PACKAGES = {
 
 let tareasActivas = 0;
 const colaEspera = [];
+const requestIdsActivos = new Set();
 
 function leerRequestStore() {
     if (!fs.existsSync(REQUEST_STORE_FILE)) {
@@ -61,17 +64,113 @@ function obtenerRequest(requestId) {
     return store[requestId] || null;
 }
 
+function obtenerMarcaDeTiempo(request = {}) {
+    const value = request.updatedAt || request.createdAt;
+    const timestamp = value ? Date.parse(value) : NaN;
+    return Number.isNaN(timestamp) ? null : timestamp;
+}
+
+function obtenerPosicionEnCola(requestId) {
+    const index = colaEspera.findIndex(item => item.requestId === requestId);
+    return index >= 0 ? index + 1 : null;
+}
+
+function solicitudSigueViva(request = {}) {
+    if (!request || !request.requestId) {
+        return false;
+    }
+
+    if (request.status === 'processing') {
+        return requestIdsActivos.has(request.requestId);
+    }
+
+    if (request.status === 'queued') {
+        return obtenerPosicionEnCola(request.requestId) !== null;
+    }
+
+    return false;
+}
+
+function solicitudAtascada(request = {}) {
+    if (!request || !['queued', 'processing'].includes(request.status)) {
+        return false;
+    }
+
+    if (!solicitudSigueViva(request)) {
+        return true;
+    }
+
+    const timestamp = obtenerMarcaDeTiempo(request);
+    if (!timestamp) {
+        return false;
+    }
+
+    const maxAge = request.status === 'queued' ? REQUEST_QUEUE_STALE_MS : REQUEST_PROCESSING_STALE_MS;
+    return (Date.now() - timestamp) > maxAge;
+}
+
+function construirResultadoInterrumpido(requestId, request = {}, message) {
+    return {
+        success: false,
+        error: message,
+        requestId,
+        roleId: request.roleId || null,
+        packageKey: request.packageKey || null,
+        retriable: true
+    };
+}
+
+function marcarSolicitudInterrumpida(requestId, request = {}, message) {
+    const result = construirResultadoInterrumpido(requestId, request, message);
+    return actualizarRequest(requestId, {
+        status: 'failed',
+        queued: false,
+        interrupted: true,
+        result
+    });
+}
+
+function limpiarSolicitudesInterrumpidas() {
+    const store = leerRequestStore();
+    let changed = false;
+
+    for (const [requestId, request] of Object.entries(store)) {
+        if (!['queued', 'processing'].includes(request?.status)) {
+            continue;
+        }
+
+        store[requestId] = {
+            ...request,
+            status: 'failed',
+            queued: false,
+            interrupted: true,
+            result: construirResultadoInterrumpido(
+                requestId,
+                request,
+                'La solicitud anterior quedó interrumpida y debe reiniciarse desde cero.'
+            ),
+            updatedAt: new Date().toISOString()
+        };
+        changed = true;
+    }
+
+    if (changed) {
+        guardarRequestStore(store);
+    }
+}
+
 async function procesarCola() {
     while (colaEspera.length > 0 && tareasActivas < MAX_CONCURRENCIA) {
         const siguiente = colaEspera.shift();
         if (siguiente) {
-            siguiente();
+            siguiente.run();
         }
     }
 }
 
 async function ejecutarCompraEnCola({ roleId, packageKey, requestId, res }) {
     tareasActivas++;
+    requestIdsActivos.add(requestId);
     actualizarRequest(requestId, {
         requestId,
         roleId,
@@ -112,6 +211,7 @@ async function ejecutarCompraEnCola({ roleId, packageKey, requestId, res }) {
         return res.status(500).json(payload);
     } finally {
         tareasActivas--;
+        requestIdsActivos.delete(requestId);
         procesarCola();
     }
 }
@@ -128,17 +228,39 @@ app.post('/comprar', async (req, res) => {
     const existente = obtenerRequest(requestId);
 
     if (existente) {
-        if (existente.status === 'processing' || existente.status === 'queued') {
-            return res.status(202).json({
-                success: true,
+        if (existente.status === 'completed' && existente.result) {
+            return res.status(200).json({
+                ...existente.result,
                 requestId,
-                status: existente.status,
-                message: 'La solicitud ya está en proceso'
+                cached: true
             });
         }
 
-        if (existente.result) {
-            return res.status(existente.status === 'completed' ? 200 : 500).json({
+        if (existente.status === 'processing' || existente.status === 'queued') {
+            if (solicitudAtascada(existente)) {
+                marcarSolicitudInterrumpida(
+                    requestId,
+                    existente,
+                    'La solicitud anterior quedó atascada. Se reiniciará desde cero.'
+                );
+            } else {
+                const queuePosition = existente.status === 'queued' ? obtenerPosicionEnCola(requestId) : null;
+                return res.status(202).json({
+                    success: true,
+                    requestId,
+                    status: existente.status,
+                    queuePosition,
+                    message: 'La solicitud ya está en proceso'
+                });
+            }
+        }
+
+        if (existente.status === 'failed') {
+            console.log(`Reintentando solicitud fallida ${requestId} desde cero`);
+        }
+
+        if (existente.result && existente.status !== 'failed') {
+            return res.status(202).json({
                 ...existente.result,
                 requestId,
                 cached: true
@@ -152,6 +274,8 @@ app.post('/comprar', async (req, res) => {
         packageKey: finalPackageKey || null,
         status: tareasActivas < MAX_CONCURRENCIA ? 'processing' : 'queued',
         queued: tareasActivas >= MAX_CONCURRENCIA,
+        interrupted: false,
+        attempts: (existente?.attempts || 0) + 1,
         createdAt: new Date().toISOString()
     });
 
@@ -166,7 +290,7 @@ app.post('/comprar', async (req, res) => {
         return ejecutar();
     }
 
-    colaEspera.push(ejecutar);
+    colaEspera.push({ requestId, run: ejecutar });
     return res.status(202).json({
         success: true,
         requestId,
@@ -211,6 +335,7 @@ app.get('/status', (req, res) => {
         environment: IS_PRODUCTION ? 'production' : 'development',
         tareasActivas,
         enCola: colaEspera.length,
+        solicitudesActivas: Array.from(requestIdsActivos),
         maxConcurrencia: MAX_CONCURRENCIA,
         paquetes_disponibles: Object.keys(DEFAULT_PACKAGES)
     });
@@ -219,6 +344,8 @@ app.get('/status', (req, res) => {
 app.get('/paquetes', (req, res) => {
     res.json(DEFAULT_PACKAGES);
 });
+
+limpiarSolicitudesInterrumpidas();
 
 app.listen(PORT, () => {
     console.log('='.repeat(50));
