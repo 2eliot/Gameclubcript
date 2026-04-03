@@ -5,14 +5,20 @@ const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { ejecutarCompra, mapearPaquetes } = require('./comprar');
+const {
+    cerrarPersistentRuntime,
+    ejecutarCompra,
+    ensurePersistentRuntime,
+    mapearPaquetes,
+    obtenerEstadoPersistentRuntime
+} = require('./comprar');
 
 const app = express();
 app.use(express.json());
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const PORT = Number(process.env.PORT || (IS_PRODUCTION ? 5005 : 5006));
-const MAX_CONCURRENCIA = 2;
+const MAX_CONCURRENCIA = 1;
 const REQUEST_STORE_FILE = path.join(__dirname, 'game-request-store.json');
 const DEFAULT_PACKAGES = {
     '50_gold': { goodsid: 'g83naxx1ena.USD.gold50.ally', goodsinfo: '50 barras de oro' },
@@ -61,7 +67,7 @@ function obtenerRequest(requestId) {
     return store[requestId] || null;
 }
 
-async function procesarCola() {
+function procesarCola() {
     while (colaEspera.length > 0 && tareasActivas < MAX_CONCURRENCIA) {
         const siguiente = colaEspera.shift();
         if (siguiente) {
@@ -85,7 +91,8 @@ async function ejecutarCompraEnCola({ roleId, packageKey, requestId, res }) {
             roleId,
             packageKey: packageKey || '',
             headless: true,
-            keepBrowserOpen: false
+            keepBrowserOpen: false,
+            persistentSession: true
         });
 
         actualizarRequest(requestId, {
@@ -181,7 +188,8 @@ app.post('/mapear', async (req, res) => {
     try {
         const resultado = await mapearPaquetes(roleId, {
             headless: true,
-            keepBrowserOpen: false
+            keepBrowserOpen: false,
+            persistentSession: true
         });
         return res.status(resultado.success ? 200 : 500).json(resultado);
     } catch (error) {
@@ -193,6 +201,25 @@ app.post('/mapear', async (req, res) => {
             fetchedAt: new Date().toISOString(),
             error: error.message
         });
+    }
+});
+
+app.post('/warmup', async (req, res) => {
+    try {
+        await ensurePersistentRuntime({ headless: true, keepBrowserOpen: true });
+        return res.json({ success: true, runtime: obtenerEstadoPersistentRuntime() });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message, runtime: obtenerEstadoPersistentRuntime() });
+    }
+});
+
+app.post('/reset-runtime', async (req, res) => {
+    try {
+        await cerrarPersistentRuntime();
+        await ensurePersistentRuntime({ headless: true, keepBrowserOpen: true });
+        return res.json({ success: true, runtime: obtenerEstadoPersistentRuntime() });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message, runtime: obtenerEstadoPersistentRuntime() });
     }
 });
 
@@ -212,6 +239,7 @@ app.get('/status', (req, res) => {
         tareasActivas,
         enCola: colaEspera.length,
         maxConcurrencia: MAX_CONCURRENCIA,
+        runtime: obtenerEstadoPersistentRuntime(),
         paquetes_disponibles: Object.keys(DEFAULT_PACKAGES)
     });
 });
@@ -220,7 +248,7 @@ app.get('/paquetes', (req, res) => {
     res.json(DEFAULT_PACKAGES);
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
     console.log('='.repeat(50));
     console.log('🚀 Servidor de compras Blood Strike');
     console.log(`📡 Escuchando en http://localhost:${PORT}`);
@@ -229,7 +257,16 @@ app.listen(PORT, () => {
     console.log('\n📖 Endpoints disponibles:');
     console.log('   POST /comprar  - { roleId: "123", packageKey: "bs_xxx", requestId: "abc" }');
     console.log('   POST /mapear   - { roleId: "123" }');
+    console.log('   POST /warmup   - Precalienta login y sesión persistente');
+    console.log('   POST /reset-runtime - Reinicia la sesión persistente');
     console.log('   GET  /requests/:id - Estado de una solicitud');
     console.log('   GET  /status   - Estado del servidor');
     console.log('   GET  /paquetes - Lista base de paquetes\n');
+
+    try {
+        await ensurePersistentRuntime({ headless: true, keepBrowserOpen: true });
+        console.log('🔥 Sesión persistente precalentada y lista para compras');
+    } catch (error) {
+        console.error(`⚠️ No se pudo precalentar la sesión persistente: ${error.message}`);
+    }
 });
