@@ -1,3 +1,6 @@
+const { loadEnvFile } = require('./env-loader');
+loadEnvFile();
+
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const crypto = require('crypto');

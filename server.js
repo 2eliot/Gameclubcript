@@ -1,3 +1,6 @@
+const { loadEnvFile } = require('./env-loader');
+loadEnvFile();
+
 const express = require('express');
 const crypto = require('crypto');
 const fs = require('fs');
