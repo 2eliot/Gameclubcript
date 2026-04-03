@@ -1,5 +1,6 @@
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
@@ -20,7 +21,8 @@ const CONFIG = {
 const EXECUTION_CONFIG = {
     targetRoleId: process.env.ROLE_ID || CONFIG.targetRoleId,
     pin: process.env.PIN || CONFIG.pin,
-    mapPackages: process.env.MAP_PACKAGES === 'true'
+    mapPackages: process.env.MAP_PACKAGES === 'true',
+    packageKey: process.env.PACKAGE_KEY || ''
 };
 const RUN_HEADLESS = process.env.HEADLESS !== 'false';
 
@@ -62,7 +64,28 @@ function isFirstPartyHost(hostname = '') {
         hostname.endsWith('.126.net');
 }
 
-function validarConfiguracion() {
+function construirPackageKey(paquete) {
+    const base = [paquete.title || '', paquete.price || '', paquete.rawText || '']
+        .map(value => String(value).trim())
+        .join('|');
+
+    return `bs_${crypto.createHash('sha1').update(base).digest('hex').slice(0, 16)}`;
+}
+
+function construirExecutionConfig(overrides = {}) {
+    const headless = overrides.headless ?? RUN_HEADLESS;
+
+    return {
+        targetRoleId: overrides.roleId || EXECUTION_CONFIG.targetRoleId,
+        pin: overrides.pin || EXECUTION_CONFIG.pin,
+        mapPackages: overrides.mapPackages ?? EXECUTION_CONFIG.mapPackages,
+        packageKey: overrides.packageKey || EXECUTION_CONFIG.packageKey || '',
+        headless,
+        keepBrowserOpen: overrides.keepBrowserOpen ?? !headless
+    };
+}
+
+function validarConfiguracion(executionConfig) {
     const faltantes = [];
 
     if (!CONFIG.email) {
@@ -73,11 +96,11 @@ function validarConfiguracion() {
         faltantes.push('GAME_PASSWORD');
     }
 
-    if (!EXECUTION_CONFIG.mapPackages && !EXECUTION_CONFIG.pin) {
+    if (!executionConfig.mapPackages && !executionConfig.pin) {
         faltantes.push('GAME_PIN o PIN');
     }
 
-    if (!EXECUTION_CONFIG.targetRoleId) {
+    if (!executionConfig.targetRoleId) {
         faltantes.push('ROLE_ID o DEFAULT_ROLE_ID');
     }
 
@@ -639,10 +662,58 @@ async function extraerPaquetesVisibles(page) {
                 goodsid,
                 title,
                 price,
-                rawText
+                rawText,
+                packageKey: null
             };
         }).filter(Boolean);
-    });
+    }).then(paquetes => paquetes.map(paquete => ({
+        ...paquete,
+        packageKey: construirPackageKey(paquete)
+    })));
+}
+
+async function seleccionarPaqueteMapeado(page, packageKey) {
+    const paquetes = await extraerPaquetesVisibles(page);
+    const target = paquetes.find(paquete => paquete.packageKey === packageKey);
+
+    if (!target) {
+        throw new Error(`No se encontró el paquete mapeado ${packageKey} en la grilla actual`);
+    }
+
+    const selectors = [
+        target.goodsid ? `[data-goodsid="${target.goodsid}"]` : null,
+        target.goodsid ? `[data-goods-id="${target.goodsid}"]` : null,
+        `text=${target.rawText}`,
+        `text=${target.title}`
+    ].filter(Boolean);
+
+    for (const selector of selectors) {
+        const option = page.locator(selector).first();
+        if (await option.isVisible({ timeout: 1200 }).catch(() => false)) {
+            await option.click();
+            return target.title;
+        }
+    }
+
+    throw new Error(`No se pudo seleccionar el paquete mapeado ${packageKey}`);
+}
+
+function construirResultadoCompra(payload) {
+    return {
+        success: payload.success,
+        mode: payload.mode || 'buy-package',
+        roleId: payload.roleId,
+        jugador: payload.jugador || null,
+        paquete: payload.paquete || null,
+        precio: payload.precio || null,
+        orden: payload.orden || null,
+        tiempo: payload.tiempo || null,
+        total: payload.total,
+        paquetes: payload.paquetes,
+        fetchedAt: payload.fetchedAt,
+        packageKey: payload.packageKey || null,
+        error: payload.error || null
+    };
 }
 
 async function activarNetEasePay(page) {
@@ -931,7 +1002,9 @@ async function obtenerBotonTopUp(context, page) {
     throw new Error(`No se encontró el botón Top-up. Botones visibles: ${buttonTexts.join(' | ') || 'ninguno'}`);
 }
 
-async function ejecutarCompra() {
+async function ejecutarCompra(options = {}) {
+    const executionConfig = construirExecutionConfig(options);
+    const runHeadless = executionConfig.headless;
     const tiempoInicio = Date.now();
     let nombreJugador = '';
     let ordenId = '';
@@ -939,9 +1012,9 @@ async function ejecutarCompra() {
     let precioComprado = '';
     
     console.log("🚀 Iniciando compra automática...");
-    validarConfiguracion();
+    validarConfiguracion(executionConfig);
     const browser = await chromium.launch({
-        headless: RUN_HEADLESS,
+        headless: runHeadless,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -1009,28 +1082,32 @@ async function ejecutarCompra() {
             await currentPage.waitForSelector('.region-name, .userid-login-btn, input[type="text"]', { state: 'visible', timeout: 15000 });
         }
 
-        console.log("🎮 Ingresando ID de personaje:", EXECUTION_CONFIG.targetRoleId);
-        await ingresarRoleIdYEsperarProductos(currentPage, EXECUTION_CONFIG.targetRoleId);
+        console.log("🎮 Ingresando ID de personaje:", executionConfig.targetRoleId);
+        await ingresarRoleIdYEsperarProductos(currentPage, executionConfig.targetRoleId);
 
-        if (EXECUTION_CONFIG.mapPackages) {
+        if (executionConfig.mapPackages) {
             await currentPage.waitForSelector('.goods-item, [data-goodsid], [data-goods-id]', {
                 state: 'visible',
                 timeout: 15000
             });
             const paquetes = await extraerPaquetesVisibles(currentPage);
-            console.log(JSON.stringify({
+            return construirResultadoCompra({
                 success: true,
                 mode: 'map-packages',
-                roleId: EXECUTION_CONFIG.targetRoleId,
+                roleId: executionConfig.targetRoleId,
                 total: paquetes.length,
-                paquetes
-            }, null, 2));
-            return;
+                paquetes,
+                fetchedAt: new Date().toISOString()
+            });
         }
 
-        console.log("🛒 Seleccionando 50 barras de oro...");
+        console.log("🛒 Seleccionando paquete...");
         await currentPage.waitForSelector('.goods-item, [data-goodsid], [data-goods-id]', { state: 'visible', timeout: 10000 });
-        paqueteComprado = await seleccionarPaquete(currentPage, CONFIG.goldPackage);
+        if (executionConfig.packageKey) {
+            paqueteComprado = await seleccionarPaqueteMapeado(currentPage, executionConfig.packageKey);
+        } else {
+            paqueteComprado = await seleccionarPaquete(currentPage, CONFIG.goldPackage);
+        }
         console.log(`✅ Paquete seleccionado: ${paqueteComprado}`);
         
         if (await carritoYaExpuesto(currentPage)) {
@@ -1057,7 +1134,7 @@ async function ejecutarCompra() {
         const pinInputs = currentPage.locator('.pass-code-input');
 
         await firstInput.click();
-        for (const pinDigit of EXECUTION_CONFIG.pin.split('')) {
+        for (const pinDigit of executionConfig.pin.split('')) {
             await currentPage.keyboard.press(pinDigit, { delay: 50 });
         }
 
@@ -1076,21 +1153,42 @@ async function ejecutarCompra() {
         console.log("🔥 ¡COMPRA COMPLETADA!");
         console.log("=".repeat(50));
         console.log(`👤 Jugador: ${nombreJugador || 'No detectado'}`);
-        console.log(`🆔 Role ID: ${EXECUTION_CONFIG.targetRoleId}`);
+        console.log(`🆔 Role ID: ${executionConfig.targetRoleId}`);
         console.log(`🎁 Paquete: ${paqueteComprado || CONFIG.goldPackage.goodsinfo}`);
         if (precioComprado) console.log(`💰 Precio: ${precioComprado}`);
         if (ordenId) console.log(`📦 Orden: ${ordenId}`);
         console.log(`⏱️ Tiempo total: ${tiempoTotal} segundos`);
         console.log("=".repeat(50) + "\n");
 
+        return construirResultadoCompra({
+            success: true,
+            roleId: executionConfig.targetRoleId,
+            jugador: nombreJugador,
+            paquete: paqueteComprado || CONFIG.goldPackage.goodsinfo,
+            precio: precioComprado,
+            orden: ordenId,
+            tiempo: `${tiempoTotal} segundos`,
+            packageKey: executionConfig.packageKey || null
+        });
+
     } catch (error) {
         const tiempoFin = Date.now();
         const tiempoTotal = ((tiempoFin - tiempoInicio) / 1000).toFixed(2);
         console.error("❌ ERROR:", error.message);
         console.log(`⏱️ Tiempo transcurrido: ${tiempoTotal} segundos`);
+        return construirResultadoCompra({
+            success: false,
+            roleId: executionConfig.targetRoleId,
+            paquete: paqueteComprado || null,
+            precio: precioComprado,
+            orden: ordenId,
+            tiempo: `${tiempoTotal} segundos`,
+            packageKey: executionConfig.packageKey || null,
+            error: error.message
+        });
     } finally {
         console.log("🏁 Proceso finalizado.");
-        if (RUN_HEADLESS) {
+        if (!executionConfig.keepBrowserOpen) {
             await browser.close();
         } else {
             console.log("👀 Navegador visible se mantiene abierto para inspección manual.");
@@ -1098,4 +1196,26 @@ async function ejecutarCompra() {
     }
 }
 
-ejecutarCompra();
+async function mapearPaquetes(roleId, options = {}) {
+    return ejecutarCompra({
+        ...options,
+        roleId,
+        mapPackages: true,
+        keepBrowserOpen: false
+    });
+}
+
+if (require.main === module) {
+    ejecutarCompra().then(resultado => {
+        if (resultado && resultado.mode === 'map-packages') {
+            console.log(JSON.stringify(resultado, null, 2));
+        }
+    });
+}
+
+module.exports = {
+    CONFIG,
+    construirPackageKey,
+    ejecutarCompra,
+    mapearPaquetes
+};
