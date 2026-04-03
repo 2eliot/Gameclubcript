@@ -38,3 +38,4 @@ playwright-report/
 
 # Local session state
 cookies.json
+game-request-store.json
